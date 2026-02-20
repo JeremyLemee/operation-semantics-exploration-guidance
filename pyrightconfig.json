@@ -1,0 +1,9 @@
+{
+  "include": ["."],
+  "exclude": [
+    "bdi_agent",
+    "llm_agent",
+    "exploration_mcp"
+  ],
+  "typeCheckingMode": "basic"
+}

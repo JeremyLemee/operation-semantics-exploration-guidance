@@ -1,0 +1,7 @@
+{
+  "llm_agent": {
+    "provider": "openai",
+    "model": "gpt-4.1-mini"
+  },
+  "execution_guidance_mcp": "http://localhost:8100/mcp"
+}
