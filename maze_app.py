@@ -1,57 +1,36 @@
+import json
+import os
+from pathlib import Path
+
 from flask import Flask, request, jsonify, abort
 
 app = Flask(__name__)
 
 # Path explorable: start -> hall -> museum -> exit1
 
-# Maze definition
-ROOMS = {
-    "start": {"type": "normal"},
-    "hall": {"type": "normal"},
-    "trap": {"type": "trap"},
-    "music_room": {"type": "normal"},
-    "billard_room": {"type": "owned", "owner": "bob", "fee": 6},
-    "ballroom": {"type": "normal"},
-    "museum": {"type": "normal"},
-    "workshop": {"type": "owned", "owner": "alice", "fee": 6},
-    "gallery": {"type": "owned", "owner": "alice", "fee": 6},
-    "library": {"type": "owned", "owner": "bob", "fee": 6},
-    "armory": {"type": "normal"},
-    "courtyard": {"type": "owned", "owner": "bob", "fee": 6},
-    "exit1": {"type": "exit"},
-    "exit2": {"type": "exit"},
-    "exit3": {"type": "exit"},
-    "exit4": {"type": "exit"},
-}
+MAZE_FILE = Path(__file__).with_name(os.environ.get("MAZE_FILE", "maze.json"))
 
-DOORS = {
-    "d1":  {"a": "start",       "b": "hall",          "locks_after_use": False},
-    "d2": {"a": "hall",        "b": "trap",          "locks_after_use": False},
-    "d3":  {"a": "hall",        "b": "music_room",    "locks_after_use": False},
-    "d4": {"a": "music_room",  "b": "library",       "locks_after_use": False},
-    "d5":  {"a": "music_room",   "b": "ballroom", "locks_after_use": True},
-    "d6": {"a": "ballroom","b": "exit3",         "locks_after_use": False},
-    "d7": {"a": "hall",        "b": "museum",        "locks_after_use": False},
-    "d8": {"a": "museum",      "b": "exit1",         "locks_after_use": False},
-    "d9": {"a": "museum",      "b": "billard_room", "locks_after_use": False},
-    "d11": {"a": "billard_room","b": "workshop",     "locks_after_use": False},
-    "d12": {"a": "workshop",    "b": "exit2",         "locks_after_use": False},
-    "d13":  {"a": "gallery",     "b": "workshop",      "locks_after_use": False},
-    "d14": {"a": "gallery",     "b": "courtyard",       "locks_after_use": False},
-    "d15":  {"a": "library",     "b": "armory",        "locks_after_use": False},
-    "d16":  {"a": "armory",      "b": "courtyard",     "locks_after_use": False},
-    "d20": {"a": "courtyard",      "b": "exit4",         "locks_after_use": False},
-}
 
-DEFAULT_BUDGET = 10
-DEFAULT_AGENT_IDS = ("bob", "alice")
+def load_maze_definition():
+    with MAZE_FILE.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+MAZE_DEFINITION = load_maze_definition()
+ROOMS = MAZE_DEFINITION["rooms"]
+DOORS = MAZE_DEFINITION["doors"]
+START_ROOM = MAZE_DEFINITION.get("start_room", "start")
+REGISTERED_AGENT_BUDGET = 10
+DEFAULT_BUDGET = MAZE_DEFINITION.get("default_budget", REGISTERED_AGENT_BUDGET)
+DEFAULT_AGENT_IDS = tuple(MAZE_DEFINITION.get("default_agent_ids", ()))
 
 
 def build_default_agents():
     return {
         agent_id: {
-            "room": "start",
+            "room": START_ROOM,
             "budget": DEFAULT_BUDGET,
+            "subscription": True,
             "status": "active",
         }
         for agent_id in DEFAULT_AGENT_IDS
@@ -62,11 +41,54 @@ AGENTS = build_default_agents()
 LOCKED_DOORS = set()
 
 
+def room_data(room_id):
+    return ROOMS[room_id]
+
+
+def room_type(room_id):
+    return room_data(room_id).get("type", "normal")
+
+
+def room_name(room_id):
+    return room_data(room_id).get("name", room_id)
+
+
+def room_fee(room_id):
+    return int(room_data(room_id).get("fee", 0))
+
+
+def room_fee_requires_no_subscription(room_id):
+    return bool(room_data(room_id).get("fee_requires_no_subscription", False))
+
+
+def room_fee_applies(agent, room_id):
+    fee = room_fee(room_id)
+    if fee <= 0:
+        return False
+    if room_fee_requires_no_subscription(room_id) and agent.get("subscription", False):
+        return False
+    return True
+
+
+def room_fee_details(room_id, agent=None):
+    fee = room_fee(room_id)
+    if fee <= 0:
+        return None
+    details = {
+        "amount": fee,
+        "requires_no_subscription": room_fee_requires_no_subscription(room_id),
+    }
+    if agent is not None:
+        details["applies_to_agent"] = room_fee_applies(agent, room_id)
+    return details
+
+
 def ensure_agent(agent_id):
     if agent_id not in AGENTS:
         AGENTS[agent_id] = {
-            "room": "start",
+            "room": START_ROOM,
             "budget": DEFAULT_BUDGET,
+            "subscription": True,
             "status": "active",
         }
     return AGENTS[agent_id]
@@ -74,8 +96,9 @@ def ensure_agent(agent_id):
 
 def reset_agent(agent_id):
     AGENTS[agent_id] = {
-        "room": "start",
+        "room": START_ROOM,
         "budget": DEFAULT_BUDGET,
+        "subscription": True,
         "status": "active",
     }
     return AGENTS[agent_id]
@@ -101,6 +124,26 @@ def other_side(door, room_id):
     return None
 
 
+def potential_exits_for_direction(door, source_room, target_room):
+    potential_exits = door.get("potential_exits", [])
+    if isinstance(potential_exits, list):
+        return potential_exits
+    if not isinstance(potential_exits, dict):
+        return []
+    if door["a"] == source_room and door["b"] == target_room:
+        return potential_exits.get("a_to_b", [])
+    if door["b"] == source_room and door["a"] == target_room:
+        return potential_exits.get("b_to_a", [])
+    return []
+
+
+def find_door_between(room_a, room_b):
+    for door_id, door in DOORS.items():
+        if {door["a"], door["b"]} == {room_a, room_b}:
+            return door_id, door
+    return None, None
+
+
 def has_available_affordance(room_id):
     return any(
         door_id not in LOCKED_DOORS and door_connects(door, room_id)
@@ -108,8 +151,8 @@ def has_available_affordance(room_id):
     )
 
 
-def build_operation_semantics(door_id, door, target_room_id, agent_id):
-    room = ROOMS[target_room_id]
+def build_operation_semantics(door_id, door, source_room_id, target_room_id, agent_id):
+    target_type = room_type(target_room_id)
     causes = []
 
     if door["locks_after_use"]:
@@ -121,39 +164,46 @@ def build_operation_semantics(door_id, door, target_room_id, agent_id):
             }
         )
 
-    if room["type"] in {"exit", "trap"}:
+    if target_type in {"exit", "trap"}:
         causes.append(
             {
                 "type": "maze:Final",
-                "detail": f"Entering {room['type']} room",
+                "detail": f"Entering {target_type} room",
                 "room_id": target_room_id,
             }
         )
 
-    if room["type"] == "owned" and room["owner"] != agent_id:
+    if room_fee_applies(AGENTS[agent_id], target_room_id):
         causes.append(
             {
                 "type": "maze:Fee",
-                "detail": "Entering room owned by another agent",
+                "detail": "Entering room incurs a fee",
                 "room_id": target_room_id,
-                "owner": room["owner"],
-                "fee": room["fee"],
+                "fee": room_fee(target_room_id),
+                "requires_no_subscription": room_fee_requires_no_subscription(target_room_id),
             }
         )
 
-    return {
+    operation = {
         "explorable": len(causes) == 0,
         "danger_causes": causes,
     }
+    fee_details = room_fee_details(target_room_id, AGENTS.get(agent_id))
+    if fee_details is not None:
+        operation["fee"] = fee_details
+    potential_exits = potential_exits_for_direction(door, source_room_id, target_room_id)
+    if potential_exits:
+        operation["potential_exits"] = list(potential_exits)
+    return operation
 
 
 def update_agent_status(agent, room_id):
-    room_type = ROOMS[room_id]["type"]
+    current_room_type = room_type(room_id)
     if agent["budget"] < 0:
         agent["status"] = "bankrupt"
-    elif room_type == "trap":
+    elif current_room_type == "trap":
         agent["status"] = "trapped"
-    elif room_type == "exit":
+    elif current_room_type == "exit":
         agent["status"] = "exited"
     elif not has_available_affordance(room_id):
         agent["status"] = "no_affordance"
@@ -164,9 +214,9 @@ def update_agent_status(agent, room_id):
 def build_visual_representation():
     rooms = {
         room_id: {
-            "type": room_data["type"],
-            "owner": room_data.get("owner"),
-            "fee": room_data.get("fee"),
+            key: value
+            for key, value in room_data.items()
+            if key in {"name", "type", "fee", "fee_requires_no_subscription"} and value is not None
         }
         for room_id, room_data in ROOMS.items()
     }
@@ -178,9 +228,9 @@ def build_visual_representation():
         room_b = door["b"]
 
         if room_a not in rooms:
-            rooms[room_a] = {"type": "unknown", "owner": None, "fee": None}
+            rooms[room_a] = {}
         if room_b not in rooms:
-            rooms[room_b] = {"type": "unknown", "owner": None, "fee": None}
+            rooms[room_b] = {}
 
         adjacency.setdefault(room_a, []).append({"door_id": door_id, "to": room_b})
         adjacency.setdefault(room_b, []).append({"door_id": door_id, "to": room_a})
@@ -191,6 +241,7 @@ def build_visual_representation():
                 "to": room_b,
                 "locks_after_use": door["locks_after_use"],
                 "locked": door_id in LOCKED_DOORS,
+                "potential_exits": door.get("potential_exits", []),
             }
         )
 
@@ -332,8 +383,7 @@ def get_visual():
   <header>
     <h1>Maze Visual</h1>
     <div class="row">
-      <input id="agentIdInput" placeholder="agent id (e.g. bob)" />
-      <input id="budgetInput" type="number" value="10" />
+      <input id="agentIdInput" placeholder="agent name (e.g. bob)" />
       <button id="registerBtn">Register Agent</button>
       <button id="resetBtn" class="danger">Reset Maze</button>
       <span id="flash" class="muted"></span>
@@ -429,8 +479,9 @@ def get_visual():
       card.className = `agent-card ${state.selectedAgentId === agentId ? "selected" : ""}`;
       card.innerHTML = `
         <div><strong>${agentId}</strong></div>
-        <div class="pill">Room: ${agent.room}</div>
+        <div class="pill">Room: ${agent.room_name || agent.room}</div>
         <div class="pill">Budget: ${agent.budget}</div>
+        <div class="pill">Subscription: ${agent.subscription ? "yes" : "no"}</div>
         <div class="pill">Status: ${agent.status}</div>
       `;
       const selectBtn = document.createElement("button");
@@ -454,8 +505,9 @@ def get_visual():
     }
     node.innerHTML = `
       <div class="pill">Agent: ${agent.agent_id}</div>
-      <div class="pill">Room: ${agent.room}</div>
+      <div class="pill">Room: ${agent.room_name || agent.room}</div>
       <div class="pill">Budget: ${agent.budget}</div>
+      <div class="pill">Subscription: ${agent.subscription ? "yes" : "no"}</div>
       <div class="pill">Status: ${agent.status}</div>
     `;
   }
@@ -477,12 +529,26 @@ def get_visual():
     }
     doors.forEach(([doorId, door]) => {
       const target = door.a === agent.room ? door.b : door.a;
+      const targetName = (state.maze.rooms?.[target]?.name || target);
       const isLocked = locked.has(doorId);
       const btn = document.createElement("button");
       btn.className = "secondary";
-      btn.textContent = `${doorId}: ${agent.room} -> ${target}${isLocked ? " (locked)" : ""}`;
+      const rawExits = door.potential_exits || [];
+      const directedExits = Array.isArray(rawExits)
+        ? rawExits
+        : door.a === agent.room && door.b === target
+          ? rawExits.a_to_b || []
+          : door.b === agent.room && door.a === target
+            ? rawExits.b_to_a || []
+            : [];
+      const exits = directedExits.length
+        ? ` [exits: ${directedExits.join(", ")}]`
+        : "";
+      btn.textContent =
+        `${doorId}: ${agent.room_name || agent.room} -> ${targetName}` +
+        `${isLocked ? " (locked)" : ""}${exits}`;
       btn.disabled = isLocked || agent.status !== "active";
-      btn.onclick = () => doMove(doorId);
+      btn.onclick = () => doMove(target);
       box.appendChild(btn);
     });
   }
@@ -500,17 +566,17 @@ def get_visual():
     renderLastAction();
   }
 
-  async function doMove(doorId) {
+  async function doMove(roomId) {
     const agentId = state.selectedAgentId;
     if (!agentId) {
       flash("Select an agent first.", true);
       return;
     }
     try {
-      const result = await apiJson("/move", {
+      const result = await apiJson(`/rooms/${encodeURIComponent(roomId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agent_id: agentId, door_id: doorId }),
+        body: JSON.stringify({ agent_id: agentId }),
       });
       state.lastAction = result;
       await refreshMaze();
@@ -527,14 +593,14 @@ def get_visual():
   async function registerAgent() {
     const agentId = document.getElementById("agentIdInput").value.trim();
     if (!agentId) {
-      flash("Agent id is required.", true);
+      flash("Agent name is required.", true);
       return;
     }
     try {
       const result = await apiJson("/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agent_id: agentId }),
+        body: JSON.stringify({ name: agentId }),
       });
       uniquePush(state.registeredAgentIds, agentId);
       state.agentStates[agentId] = result;
@@ -542,6 +608,7 @@ def get_visual():
       state.lastAction = {
         message: `Registered ${agentId} at room ${result.room}`,
         room: result.room,
+        room_name: result.room_name,
         budget: result.budget,
         status: result.status,
       };
@@ -584,7 +651,7 @@ def get_visual():
 
 @app.route("/status", methods=["GET"])
 def get_status():
-    agent_id = request.args.get("agent_id") or "bob"
+    agent_id = request.args.get("agent_id") or request.args.get("name") or "bob"
     agent = AGENTS.get(agent_id)
     if agent is None:
         return jsonify({"error": f"Unknown agent '{agent_id}'."}), 404
@@ -594,24 +661,33 @@ def get_status():
             "agent_id": agent_id,
             "room": agent["room"],
             "budget": agent["budget"],
+            "subscription": bool(agent.get("subscription", False)),
             "status": agent["status"],
             "end": agent_has_ended(agent),
+            "room_name": room_name(agent["room"]),
+            "room_fee": room_fee_details(agent["room"], agent),
         }
     )
 
 
 @app.route("/register", methods=["POST"])
 def register():
-    data = request.json or {}
-    agent_id = data.get("agent_id")
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "/register expects a JSON object body."}), 400
+
+    agent_id = data.get("name") or data.get("agent_id")
     if not agent_id:
-        abort(400, "Missing agent_id")
-    unexpected_fields = sorted(set(data.keys()) - {"agent_id"})
+        abort(400, "Missing name")
+    unexpected_fields = sorted(set(data.keys()) - {"name", "agent_id", "subscription"})
     if unexpected_fields:
         return (
             jsonify(
                 {
-                    "error": "Only 'agent_id' is allowed in /register payload.",
+                    "error": (
+                        "Only 'name', 'agent_id', and 'subscription' "
+                        "are allowed in /register payload."
+                    ),
                     "unexpected_fields": unexpected_fields,
                 }
             ),
@@ -621,31 +697,40 @@ def register():
         return jsonify({"error": f"Agent '{agent_id}' is already registered."}), 400
 
     agent = {
-        "room": "start",
+        "room": START_ROOM,
         "budget": DEFAULT_BUDGET,
+        "subscription": bool(data.get("subscription", True)),
         "status": "active",
     }
     AGENTS[agent_id] = agent
     return jsonify(
         {
             "agent_id": agent_id,
+            "name": agent_id,
             "room": agent["room"],
             "budget": agent["budget"],
+            "subscription": agent["subscription"],
             "status": agent["status"],
             "end": agent_has_ended(agent),
+            "room_name": room_name(agent["room"]),
+            "room_fee": room_fee_details(agent["room"], agent),
         }
     )
 
 
-@app.route("/move", methods=["POST"])
-def move():
-    data = request.json or {}
-    agent_id = data.get("agent_id")
-    door_id = data.get("door_id")
-    if not agent_id or not door_id:
-        abort(400, "Missing agent_id or door_id")
+@app.route("/rooms/<room_id>", methods=["POST"])
+def move_to_room(room_id):
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": f"/rooms/{room_id} expects a JSON object body."}), 400
 
-    agent = ensure_agent(agent_id)
+    agent_id = data.get("agent_id") or data.get("name")
+    if not agent_id:
+        abort(400, "Missing agent_id")
+
+    agent = AGENTS.get(agent_id)
+    if agent is None:
+        return jsonify({"message": f"Unknown agent '{agent_id}'."}), 404
     update_agent_status(agent, agent["room"])
     if agent["status"] != "active":
         return jsonify(
@@ -657,12 +742,12 @@ def move():
             }
         ), 400
 
-    door = DOORS.get(door_id)
-    if not door:
-        abort(404, "Unknown door_id")
+    if room_id not in ROOMS:
+        abort(404, "Unknown room_id")
 
-    if not door_connects(door, agent["room"]):
-        abort(400, "Door does not connect to agent's current room")
+    door_id, door = find_door_between(agent["room"], room_id)
+    if door is None:
+        abort(400, "Target room is not reachable from agent's current room")
 
     if door_id in LOCKED_DOORS:
         return jsonify(
@@ -685,17 +770,13 @@ def move():
             }
         ), 400
 
-    target_room = other_side(door, agent["room"])
-    if target_room is None:
-        abort(400, "Door does not connect to agent's current room")
-    operation = build_operation_semantics(door_id, door, target_room, agent_id)
+    operation = build_operation_semantics(door_id, door, agent["room"], room_id, agent_id)
 
     # Apply room entry effects
-    room = ROOMS[target_room]
-    if room["type"] == "owned" and room["owner"] != agent_id:
-        agent["budget"] -= room["fee"]
+    if room_fee_applies(agent, room_id):
+        agent["budget"] -= room_fee(room_id)
 
-    agent["room"] = target_room
+    agent["room"] = room_id
 
     if door["locks_after_use"]:
         LOCKED_DOORS.add(door_id)
@@ -704,12 +785,15 @@ def move():
 
     return jsonify(
         {
-            "message": f"Moved through {door_id}",
+            "message": f"Moved to {room_name(room_id)} ({room_id})",
             "agent_id": agent_id,
             "room": agent["room"],
             "budget": agent["budget"],
+            "subscription": bool(agent.get("subscription", False)),
             "status": agent["status"],
             "end": agent_has_ended(agent),
+            "room_name": room_name(agent["room"]),
+            "room_fee": room_fee_details(agent["room"], agent),
             "operation": operation,
         }
     )
@@ -723,8 +807,11 @@ def restart(agent_id):
             "agent_id": agent_id,
             "room": agent["room"],
             "budget": agent["budget"],
+            "subscription": bool(agent.get("subscription", False)),
             "status": agent["status"],
             "end": agent_has_ended(agent),
+            "room_name": room_name(agent["room"]),
+            "room_fee": room_fee_details(agent["room"], agent),
         }
     )
 
@@ -852,11 +939,9 @@ def gui():
   <header>
     <h1>Maze Debug GUI</h1>
     <div class="row">
-      <label for="agentId">Agent ID</label>
+      <label for="agentId">Agent Name</label>
       <input id="agentId" value="tester" />
-      <label for="budgetInput">Budget</label>
-      <input id="budgetInput" type="number" value="10" />
-      <button id="registerBtn">Register / Update</button>
+      <button id="registerBtn">Register</button>
       <button id="resetBtn" class="danger">Reset Maze</button>
     </div>
     <div class="row">
@@ -906,7 +991,8 @@ def gui():
 
   function renderAgent() {
     document.getElementById("agentState").textContent = JSON.stringify(state.agent, null, 2);
-    document.getElementById("roomPill").textContent = `Room: ${state.agent.room}`;
+    document.getElementById("roomPill").textContent =
+      `Room: ${state.agent.room_name || state.agent.room}`;
     document.getElementById("budgetPill").textContent = `Budget: ${state.agent.budget}`;
     document.getElementById("statusPill").textContent = `Status: ${state.agent.status}`;
   }
@@ -927,10 +1013,22 @@ def gui():
       const btn = document.createElement("button");
       btn.className = "door-btn";
       const target = door.a === room ? door.b : door.a;
+      const targetName = (state.maze.rooms?.[target]?.name || target);
       const lockedLabel = locked.has(doorId) ? " (locked)" : "";
-      btn.textContent = `${doorId} -> ${target}${lockedLabel}`;
+      const rawExits = door.potential_exits || [];
+      const directedExits = Array.isArray(rawExits)
+        ? rawExits
+        : door.a === room && door.b === target
+          ? rawExits.a_to_b || []
+          : door.b === room && door.a === target
+            ? rawExits.b_to_a || []
+            : [];
+      const exits = directedExits.length
+        ? ` [exits: ${directedExits.join(", ")}]`
+        : "";
+      btn.textContent = `${doorId} -> ${targetName}${lockedLabel}${exits}`;
       btn.disabled = locked.has(doorId) || state.agent.status !== "active";
-      btn.onclick = () => doMove(doorId);
+      btn.onclick = () => doMove(target);
       container.appendChild(btn);
     });
   }
@@ -944,12 +1042,12 @@ def gui():
     return document.getElementById("agentId").value.trim() || "tester";
   }
 
-  async function doMove(doorId) {
+  async function doMove(roomId) {
     const agentId = getAgentId();
-    const res = await fetch("/move", {
+    const res = await fetch(`/rooms/${encodeURIComponent(roomId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: agentId, door_id: doorId }),
+      body: JSON.stringify({ name: agentId }),
     });
     const data = await res.json();
     state.lastOp = data;

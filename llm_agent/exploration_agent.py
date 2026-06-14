@@ -9,42 +9,48 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 _CONFIG_PATH = _ROOT / "config.json"
 
-from config_loader import load_config
-from llm_agent.web_agent import WebAgent
+from config_loader import load_config  # noqa: E402
+from llm_agent.web_agent import WebAgent  # noqa: E402
 
-GOAL_PROMPT_TEMPLATE = """
-You are an exploration agent in a maze scenario designed to demonstrate exploration guidance semantics and how an agent reasons about them with its own internal objective (unknown to the service providing guidance).
+GOAL_PROMPT_TEMPLATE = (
+    "\n"
+    "You are an exploration agent in a maze scenario designed to demonstrate exploration "
+    "guidance semantics and how an agent reasons about them with its own internal objective.\n"
+    "\n"
+    'Critical first action: call the http_post_request tool with URL '
+    '"http://localhost:5001/register" and JSON body "{{\\"name\\": \\"{agent_id}\\"}}".\n'
+    "\n"
+    "Goal: reach room {goal}.\n"
+    "\n"
+    "You are: {agent_id}.\n"
+    "\n"
+    "Maze semantics:\n"
+    "- Room names follow the form room{{i}}. Rooms do not have owner metadata and generally "
+    "do not have special room types.\n"
+    "- Agents must register before they can act. Registration gives the agent an initial "
+    "budget of 10.\n"
+    "- Agents move between rooms through doors. Passing through a door is usually "
+    "explorable, but some doors become locked after use.\n"
+    "- Guidance may include outcomes such as the destination room and potential reachable "
+    "goal rooms. Use that information to plan toward {goal}.\n"
+    "- If you reach a room with no available moves, you are stuck and should stop.\n"
+    "\n"
+    "Agents present:\n"
+    "- Only {agent_id} is actually run.\n"
+    "\n"
+    "Instruction: Use the exploration guidance information to decide when to act, while "
+    "still optimizing for reaching room {goal}.\n"
+    "\n"
+    "Notes:\n"
+    "- Call http_post_request exactly once at the beginning to register "
+    "- After that, only use maze operation tools and stop.\n"
+    "\n"
+    "When a response shows that your current room is {goal}, stop execution immediately "
+    'by calling {{"tool": "stop"}}. Also stop when you can no longer move. Do nothing '
+    "else after either condition is true.\n"
+)
 
-Critical first action: call the set_goal tool with parameter {goal}.
-
-Critical second action: call the http_request tool with parameter "http://localhost:5001/status?agent_id={agent_id}".
-
-Goal: reach {goal}.
-
-You are: {agent_id}.
-
-Maze semantics:
-- The maze has many exits in different rooms. The agent's main goal is to reach the specified exit ({goal}).
-- Agents move between rooms through doors. Passing through a door is typically an explorable operation, but some doors become locked after use. A locked door makes that operation non-explorable.
-- There are trap rooms from which the agent can never escape. Moving to an exit or to a trap room are non-explorable operations with a danger cause of type maze:Final.
-- Some rooms are owned (owner can be bob, alice, or someone else). Moving to an owned room is non-explorable with danger cause type maze:Fee because a fee is paid if the room does not belong to the agent.
-- The agent starts with a budget. If the budget becomes negative after entering an owned room, the agent cannot move anymore and cannot achieve its goal.
-
-Agents present:
-- Two agents exist: bob and alice. Only {agent_id} is actually run.
-- Rooms owned by the current agent can be used at no cost by that agent, even if the exploration guidance model marks the operation as non-explorable.
-- Rooms owned by other agents are non-explorable for the model and also costly/risky.
-
-Instruction: Use the exploration guidance information to decide when to act, while still optimizing for reaching {goal} under the above constraints.
-
-Notes:
-- If your budget decreases, update your budget using the corresponding tool. Otherwise, do not use that tool.
-- Use the set_goal tool once at the beginning to register your goal, then the http_request tool once at the beginning, and the stop tool when your task is completed or when you can no longer move. Otherwise, only use the tools to move in the maze.
-
-When you reach an exit, or a situation where you are no longer able to move, stop execution immediately by calling {{"tool": "stop"}}. Do nothing else. Do not call stop if you can still move in the maze.
-"""
-
-DEFAULT_GOAL = "exit1"
+DEFAULT_GOAL = "room9"
 DEFAULT_AGENT_ID = "bob"
 
 

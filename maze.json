@@ -1,0 +1,231 @@
+{
+  "start_room": "room0",
+  "rooms": {
+    "room0": {
+      "name": "start"
+    },
+    "room1": {
+      "name": "Log off"
+    },
+    "room2": {
+      "name": "Main interface"
+    },
+    "room3": {
+      "name": "Turn first light on"
+    },
+    "room4": {
+      "name": "Turn off all devices"
+    },
+    "room5": {
+      "name": "Open first blinds",
+      "fee": 7,
+      "fee_requires_no_subscription": false
+    },
+    "room6": {
+      "name": "Turn second light on",
+      "fee": 15,
+      "fee_requires_no_subscription": true
+    },
+    "room7": {
+      "name": "Open second blinds",
+      "fee": 7,
+      "fee_requires_no_subscription": false
+    },
+    "exit1": {
+      "name": "Exit 1",
+      "type": "exit"
+    },
+    "exit2": {
+      "name": "Exit 2",
+      "type": "exit"
+    },
+    "exit3": {
+      "name": "Exit 3",
+      "type": "exit"
+    },
+    "exit4": {
+      "name": "Exit 4",
+      "type": "exit"
+    }
+  },
+  "doors": {
+    "d1": {
+      "a": "room0",
+      "b": "room1",
+      "locks_after_use": true,
+      "potential_exits": {
+        "a_to_b": [],
+        "b_to_a": [
+          "exit1",
+          "exit2",
+          "exit3",
+          "exit4"
+        ]
+      }
+    },
+    "d2": {
+      "a": "room0",
+      "b": "room2",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit1",
+          "exit2",
+          "exit3",
+          "exit4"
+        ],
+        "b_to_a": []
+      }
+    },
+    "d3": {
+      "a": "room2",
+      "b": "room3",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit1",
+          "exit4"
+        ],
+        "b_to_a": [
+          "exit2",
+          "exit3"
+        ]
+      }
+    },
+    "d4": {
+      "a": "room3",
+      "b": "exit1",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit1"
+        ],
+        "b_to_a": [
+          "exit2",
+          "exit3",
+          "exit4"
+        ]
+      }
+    },
+    "d5": {
+      "a": "room2",
+      "b": "room4",
+      "locks_after_use": true,
+      "potential_exits": {
+        "a_to_b": [
+          "exit2"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit3",
+          "exit4"
+        ]
+      }
+    },
+    "d6": {
+      "a": "room4",
+      "b": "exit2",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit2"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit3",
+          "exit4"
+        ]
+      }
+    },
+    "d7": {
+      "a": "room2",
+      "b": "room5",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit3",
+          "exit4"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit2"
+        ]
+      }
+    },
+    "d8": {
+      "a": "room5",
+      "b": "exit3",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit3"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit2",
+          "exit4"
+        ]
+      }
+    },
+    "d9": {
+      "a": "room3",
+      "b": "room6",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit4"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit2",
+          "exit3"
+        ]
+      }
+    },
+    "d10": {
+      "a": "room5",
+      "b": "room7",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit4"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit2",
+          "exit3"
+        ]
+      }
+    },
+    "d11": {
+      "a": "room6",
+      "b": "exit4",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit4"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit2",
+          "exit3"
+        ]
+      }
+    },
+    "d12": {
+      "a": "room7",
+      "b": "exit4",
+      "locks_after_use": false,
+      "potential_exits": {
+        "a_to_b": [
+          "exit4"
+        ],
+        "b_to_a": [
+          "exit1",
+          "exit2",
+          "exit3"
+        ]
+      }
+    }
+  }
+}

@@ -1,6 +1,5 @@
 from typing import Optional
 from pathlib import Path
-from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import LLM
 
 from llm_agent.coala.coala import Coala
@@ -14,7 +13,7 @@ _CONFIG_PATH = _ROOT / "config.json"
 
 
 class WebAgent(Coala):
-    """A specialized agent based on Coala architecture that focuses on web interactions and signifier handling."""
+    """A specialized agent based on Coala for web interactions."""
 
     def __init__(
         self,
@@ -30,7 +29,12 @@ class WebAgent(Coala):
 
         if llm is None:
             cfg = load_config(str(_CONFIG_PATH))
-            llm = load_llm(cfg["llm_agent"]["provider"], cfg["llm_agent"]["model"])
+            llm = load_llm(
+                cfg["llm_agent"]["provider"],
+                cfg["llm_agent"]["model"],
+                reasoning=cfg["llm_agent"].get("reasoning"),
+                thinking=cfg["llm_agent"].get("thinking"),
+            )
 
         # Initialize the base Coala agent with our specific configuration
         super().__init__(

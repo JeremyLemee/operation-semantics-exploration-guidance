@@ -262,7 +262,10 @@ def _coerce_from_schema(user_text: str, schema: dict) -> Any:
     if t == "number":
         return float(user_text)
 
-    # string / unknown / union: accept raw string, but allow JSON literals if user types them
+    if t == "string":
+        return user_text
+
+    # unknown / union / schema variants: accept raw text, but allow JSON literals.
     try:
         return json.loads(user_text)
     except Exception:
@@ -336,9 +339,9 @@ async def repl(session: ClientSession) -> None:
         if not line:
             continue
 
-        parts = shlex.split(line)
-        cmd = parts[0].lower()
-        rest = parts[1:]
+        cmd, _, raw_rest = line.partition(" ")
+        cmd = cmd.lower()
+        rest = raw_rest.lstrip()
 
         try:
             if cmd in ("quit", "exit"):
@@ -353,7 +356,8 @@ async def repl(session: ClientSession) -> None:
                 continue
 
             if cmd == "tools":
-                cursor = rest[0] if rest else None
+                parts = shlex.split(line)
+                cursor = parts[1] if len(parts) > 1 else None
                 resp = await session.list_tools(cursor=cursor)
                 _print_tool_list(resp)
                 if resp.nextCursor:
@@ -361,7 +365,8 @@ async def repl(session: ClientSession) -> None:
                 continue
 
             if cmd == "resources":
-                cursor = rest[0] if rest else None
+                parts = shlex.split(line)
+                cursor = parts[1] if len(parts) > 1 else None
                 resp = await session.list_resources(cursor=cursor)
                 _print_resource_list(resp)
                 if resp.nextCursor:
@@ -372,7 +377,7 @@ async def repl(session: ClientSession) -> None:
                 if not rest:
                     print("Usage: read <uri>")
                     continue
-                uri_str = rest[0]
+                uri_str = shlex.split(line, posix=True)[1]
                 resp = await _read_resource_raw(session, uri_str)
                 _print_read_result(resp)
                 continue
@@ -381,7 +386,7 @@ async def repl(session: ClientSession) -> None:
                 if not rest:
                     print("Usage: desc <tool_name>")
                     continue
-                tool_name = rest[0]
+                tool_name = shlex.split(line, posix=True)[1]
                 tool = await _find_tool(session, tool_name)
                 if tool is None:
                     print(f"Tool not found: {tool_name}")
@@ -394,18 +399,27 @@ async def repl(session: ClientSession) -> None:
                     print("Usage: call [-p] <tool_name> [jsonArgs]")
                     continue
 
-                # NEW: -p option (prompt for params)
                 prompt_mode = False
-                if rest[0] == "-p":
+                if rest.startswith("-p"):
+                    if len(rest) == 2 or rest[2].isspace():
+                        # Accept "-p" only when it is a standalone token.
+                        prompt_mode = True
+                        rest = rest[2:].lstrip()
+                if prompt_mode:
+                    if not rest:
+                        print("Usage: call [-p] <tool_name> [jsonArgs]")
+                        continue
+                elif rest.startswith("-p "):
                     prompt_mode = True
-                    rest = rest[1:]
+                    rest = rest[3:]
 
                 if not rest:
                     print("Usage: call [-p] <tool_name> [jsonArgs]")
                     continue
 
-                tool_name = rest[0]
-                json_args = " ".join(rest[1:]) if len(rest) > 1 else ""
+                tool_name, sep, json_args = rest.partition(" ")
+                tool_name = tool_name.strip()
+                json_args = json_args.lstrip()
 
                 if prompt_mode:
                     tool = await _find_tool(session, tool_name)

@@ -99,25 +99,8 @@ class ExplorationGuidance:
             info_model = self._model.info[name]
             return _render_info_model(info_model)
 
-        @self.app.route("/policy", methods=["GET", "POST"])
-        def policy():
-            if request.method == "GET":
-                return {"policy": self._model.get_policy()}
-            data = request.get_json(silent=True)
-            payload = data if isinstance(data, dict) else {}
-            policy_value = request.args.get("policy") or payload.get("policy")
-            if not isinstance(policy_value, str) or not policy_value:
-                abort(400, description="Provide a non-empty policy value.")
-            try:
-                self._model.set_policy(policy_value)
-            except ValueError as exc:
-                abort(400, description=str(exc))
-            return {"policy": self._model.get_policy()}
-
         @self.app.after_request
         def apply_transformation(response: Response):
-            if request.path == "/policy":
-                return response
             r = self._model.process(request, response)
             response.headers["Link"] = "<" + r["link"] + '>;rel="guidance"'
             return response
@@ -164,21 +147,6 @@ class ExplorationGuidanceProxy:
             info_model = self._model.info[name]
             return _render_info_model(info_model)
 
-        @self.app.route("/policy", methods=["GET", "POST"])
-        def policy():
-            if request.method == "GET":
-                return {"policy": self._model.get_policy()}
-            data = request.get_json(silent=True)
-            payload = data if isinstance(data, dict) else {}
-            policy_value = request.args.get("policy") or payload.get("policy")
-            if not isinstance(policy_value, str) or not policy_value:
-                abort(400, description="Provide a non-empty policy value.")
-            try:
-                self._model.set_policy(policy_value)
-            except ValueError as exc:
-                abort(400, description=str(exc))
-            return {"policy": self._model.get_policy()}
-
         @self.app.route(
             "/<path:rest>",
             methods=[
@@ -211,8 +179,6 @@ class ExplorationGuidanceProxy:
 
         @self.app.after_request
         def apply_transformation(response: Response):
-            if request.path == "/policy":
-                return response
             r = self._model.process(request, response)
             response.headers["Link"] = "<" + r["link"] + '>;rel="guidance"'
             return response

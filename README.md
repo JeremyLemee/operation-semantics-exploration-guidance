@@ -20,6 +20,8 @@ You need to have [`uv`](https://docs.astral.sh/uv/) installed.
 
 Set an OpenAI API key in [`API_KEY.txt`](API_KEY.txt) to use an OpenAI model. The model to use can be configured in [`config.json`](config.json). 
 
+Define the structure of the maze in [`maze.json`](maze.json).
+
 ### Run the server
 
 The server can be run with: 

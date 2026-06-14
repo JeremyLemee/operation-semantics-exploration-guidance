@@ -1,8 +1,10 @@
 import datetime as dt
 import json
 import multiprocessing as mp
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http import HTTPStatus
@@ -13,27 +15,30 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-from llm_agent.exploration_agent import run_agent_once
-from maze_model import MazeModel
+EVALUATION_MAZE_FILE = os.environ.get("EVALUATION_MAZE_FILE", "maze.json")
+os.environ["MAZE_FILE"] = EVALUATION_MAZE_FILE
+
+from llm_agent.exploration_agent import run_agent_once  # noqa: E402
+from maze_model import MazeModel  # noqa: E402
 
 
-RUNS_PER_COMBINATION = 15
+RUNS_PER_COMBINATION = 20
 MAX_AGENT_CYCLES = 60
 AGENT_ID = "bob"
-ALLOWED_POLICIES = ["all"]
-GUIDANCE_ALLOWED_POLICIES = ["outcome_only"]
-TOOL_DESCRIPTION_MODES = ["all"]
+GUIDANCE_ALLOWED_POLICIES = [
+    "explorability"
+]
 ALLOWED_GOALS = ["exit1", "exit2", "exit3", "exit4"]
 RESULTS_FILE = Path("results.txt")
 SAVEPOINT_DIR = Path("evaluation_savepoints")
 EVALUATION_DASHBOARD_HOST = "127.0.0.1"
 EVALUATION_DASHBOARD_PORT = 8765
 
-MAZE_RESET_URL = "http://localhost:5001/reset"
-MAZE_STATUS_URL = "http://localhost:5001/status"
-MAZE_HEALTH_URL = "http://localhost:5001/maze"
-MCP_HEALTH_URL = "http://localhost:8100/mcp"
-GUIDANCE_POLICY_URL = "http://localhost:5001/policy"
+MAZE_RESET_URL = "http://127.0.0.1:5001/reset"
+MAZE_STATUS_URL = "http://127.0.0.1:5001/status"
+MAZE_HEALTH_URL = "http://127.0.0.1:5001/maze"
+MCP_HEALTH_URL = "http://127.0.0.1:8100/mcp"
+MCP_STATE_URL = "http://127.0.0.1:8101/state"
 COALA_STOP_URL = "http://127.0.0.1:8001/stop"
 
 
@@ -52,8 +57,6 @@ class EvaluationState:
             "agent_id": AGENT_ID,
             "guidance_policies": GUIDANCE_ALLOWED_POLICIES,
             "goals": [],
-            "policies": [],
-            "tool_description_modes": TOOL_DESCRIPTION_MODES,
             "total_runs_planned": 0,
             "runs_completed": 0,
             "current_run": None,
@@ -390,9 +393,7 @@ class _EvalDashboardHandler(BaseHTTPRequestHandler):
         <div class="kv"><b class="ok">Successes:</b> ${successes}
         | <b class="bad">Failures:</b> ${failures}</div>
         <div class="kv"><b>Goals:</b> ${esc((s.goals||[]).join(', '))}</div>
-        <div class="kv"><b>Policies:</b> ${esc((s.policies||[]).join(', '))}</div>
         <div class="kv"><b>Guidance Policies:</b> ${esc((s.guidance_policies||[]).join(', '))}</div>
-        <div class="kv"><b>Modes:</b> ${esc((s.tool_description_modes||[]).join(', '))}</div>
         <div class="kv"><b>Savepoints:</b> ${esc((s.savepoints||[]).length)}</div>
       `;
       const select = document.getElementById('savepointSelect');
@@ -436,19 +437,22 @@ def _start_dashboard_server() -> ThreadingHTTPServer:
 
 
 class ManagedProcess:
-    def __init__(self, name: str, popen: subprocess.Popen):
+    def __init__(self, name: str, popen: subprocess.Popen, output_file):
         self.name = name
         self.popen = popen
+        self.output_file = output_file
 
     def stop(self) -> None:
-        if self.popen.poll() is not None:
-            return
-        self.popen.terminate()
         try:
-            self.popen.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.popen.kill()
-            self.popen.wait(timeout=5)
+            if self.popen.poll() is None:
+                self.popen.terminate()
+                try:
+                    self.popen.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.popen.kill()
+                    self.popen.wait(timeout=5)
+        finally:
+            self.output_file.close()
 
 
 def _agent_worker(
@@ -533,23 +537,87 @@ def _wait_for_http(url: str, timeout_s: float = 20.0) -> bool:
     return False
 
 
+def _validate_evaluation_maze_service() -> None:
+    response = requests.get(MAZE_HEALTH_URL, timeout=5)
+    response.raise_for_status()
+    payload = response.json()
+    rooms = payload.get("rooms") if isinstance(payload, dict) else None
+    if not isinstance(rooms, dict) or "room0" not in rooms or "start" in rooms:
+        raise RuntimeError(
+            f"The maze service at 127.0.0.1:5001 is not serving {EVALUATION_MAZE_FILE}. "
+            "Stop the existing service or restart evaluation.py so it can start "
+            f"test_guidance.py with MAZE_FILE={EVALUATION_MAZE_FILE}."
+        )
+
+
 def _ensure_service(
-    name: str, health_url: str, cmd: List[str], cwd: Path
+    name: str,
+    health_url: str,
+    cmd: List[str],
+    cwd: Path,
+    extra_health_urls: Optional[List[str]] = None,
 ) -> Optional[ManagedProcess]:
+    extra_health_urls = extra_health_urls or []
     if _wait_for_http(health_url, timeout_s=1.0):
+        for extra_url in extra_health_urls:
+            if not _wait_for_http(extra_url, timeout_s=5.0):
+                raise RuntimeError(
+                    f"{name} is partially available: {health_url} responds, "
+                    f"but required endpoint {extra_url} does not. Stop the existing "
+                    "service on that port and restart evaluation.py."
+                )
+        if health_url == MAZE_HEALTH_URL:
+            _validate_evaluation_maze_service()
         return None
 
+    env = os.environ.copy()
+    env["MAZE_FILE"] = EVALUATION_MAZE_FILE
+    maze_file_path = cwd / EVALUATION_MAZE_FILE
+    if not maze_file_path.is_file():
+        raise RuntimeError(
+            f"Evaluation maze file does not exist: {maze_file_path}. "
+            "Set EVALUATION_MAZE_FILE to an existing maze JSON file or add the file."
+        )
+    output_file = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
     popen = subprocess.Popen(
         cmd,
         cwd=str(cwd),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        env=env,
+        stdout=output_file,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
-    if not _wait_for_http(health_url, timeout_s=30.0):
+    ready = _wait_for_http(health_url, timeout_s=30.0)
+    if ready:
+        for extra_url in extra_health_urls:
+            if not _wait_for_http(extra_url, timeout_s=30.0):
+                ready = False
+                health_url = extra_url
+                break
+    if not ready:
         if popen.poll() is None:
             popen.terminate()
-        raise RuntimeError(f"{name} did not become ready at {health_url}")
-    return ManagedProcess(name=name, popen=popen)
+            try:
+                popen.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                popen.kill()
+                popen.wait(timeout=5)
+        output_file.seek(0)
+        startup_output = output_file.read().strip()
+        output_file.close()
+        details = (
+            f"\nStartup output:\n{startup_output}"
+            if startup_output
+            else "\nStartup output was empty."
+        )
+        raise RuntimeError(f"{name} did not become ready at {health_url}.{details}")
+    try:
+        if health_url == MAZE_HEALTH_URL:
+            _validate_evaluation_maze_service()
+    except Exception:
+        ManagedProcess(name=name, popen=popen, output_file=output_file).stop()
+        raise
+    return ManagedProcess(name=name, popen=popen, output_file=output_file)
 
 
 def _discover_exit_goals() -> List[str]:
@@ -570,27 +638,20 @@ def _discover_exit_goals() -> List[str]:
     return selected_goals
 
 
-def _discover_policies() -> List[str]:
-    selected = list(ALLOWED_POLICIES)
-    if not selected:
-        raise RuntimeError("No policies configured in ALLOWED_POLICIES.")
-    return selected
-
-
 def _reset_maze() -> None:
     response = requests.post(MAZE_RESET_URL, timeout=5)
     response.raise_for_status()
 
 
-def _set_guidance_policy(policy: str) -> None:
+def _set_mcp_guidance_policy(policy: str) -> None:
     if policy not in GUIDANCE_ALLOWED_POLICIES:
         raise ValueError(
-            "Invalid guidance policy: "
+            "Invalid MCP guidance policy: "
             f"{policy!r}. Expected one of {GUIDANCE_ALLOWED_POLICIES}."
         )
-    response = requests.post(
-        GUIDANCE_POLICY_URL,
-        json={"policy": policy},
+    response = requests.patch(
+        MCP_STATE_URL,
+        json={"tool_description_mode": policy},
         timeout=5,
     )
     response.raise_for_status()
@@ -653,18 +714,14 @@ def _normalize_record(rec: Dict) -> Dict:
 def _build_exception_record(
     *,
     goal: str,
-    policy: str,
     guidance_policy: str,
-    tool_description_mode: str,
     run_idx: int,
     exc: Exception,
 ) -> Dict:
     return _normalize_record(
         {
             "goal": goal,
-            "policy": policy,
             "guidance_policy": guidance_policy,
-            "tool_description_mode": tool_description_mode,
             "run": run_idx,
             "success": False,
             "error": str(exc),
@@ -682,9 +739,7 @@ def _build_exception_record(
 
 def _run_single(
     goal: str,
-    policy: str,
     guidance_policy: str,
-    tool_description_mode: str,
     run_idx: int,
 ) -> Dict:
     if EVAL_CONTROL.stop_requested():
@@ -694,9 +749,7 @@ def _run_single(
         phase="running",
         current_run={
             "goal": goal,
-            "policy": policy,
             "guidance_policy": guidance_policy,
-            "tool_description_mode": tool_description_mode,
             "run": run_idx,
             "status": "starting",
         },
@@ -705,11 +758,10 @@ def _run_single(
     )
     EVAL_STATE.add_event(
         "Run "
-        f"{run_idx} started for goal={goal}, policy={policy}, "
-        f"guidance_policy={guidance_policy}, mode={tool_description_mode}"
+        f"{run_idx} started for goal={goal}, guidance_policy={guidance_policy}"
     )
     _reset_maze()
-    _set_guidance_policy(guidance_policy)
+    _set_mcp_guidance_policy(guidance_policy)
 
     runner = AgentRunner(
         goal=goal,
@@ -738,9 +790,7 @@ def _run_single(
             latest_maze_status=status,
             current_run={
                 "goal": goal,
-                "policy": policy,
                 "guidance_policy": guidance_policy,
-                "tool_description_mode": tool_description_mode,
                 "run": run_idx,
                 "status": "running",
                 "maze_status": status,
@@ -811,9 +861,7 @@ def _run_single(
 
     result = {
         "goal": goal,
-        "policy": policy,
         "guidance_policy": guidance_policy,
-        "tool_description_mode": tool_description_mode,
         "run": run_idx,
         "success": bool(success),
         "final_status": status.get("status"),
@@ -830,9 +878,7 @@ def _run_single(
     EVAL_STATE.update(
         current_run={
             "goal": goal,
-            "policy": policy,
             "guidance_policy": guidance_policy,
-            "tool_description_mode": tool_description_mode,
             "run": run_idx,
             "status": "finished",
             "result": result,
@@ -849,18 +895,16 @@ def _run_single(
 
 
 def _aggregate(records: List[Dict]) -> List[Dict]:
-    grouped: Dict[Tuple[str, str, str, str], List[Dict]] = {}
+    grouped: Dict[Tuple[str, str], List[Dict]] = {}
     for rec in records:
         key = (
             rec["goal"],
-            rec["policy"],
             rec["guidance_policy"],
-            rec["tool_description_mode"],
         )
         grouped.setdefault(key, []).append(rec)
 
     summary: List[Dict] = []
-    for (goal, policy, guidance_policy, mode), group in sorted(grouped.items()):
+    for (goal, guidance_policy), group in sorted(grouped.items()):
         runs = len(group)
         successes = [r for r in group if r["success"]]
         failures = [r for r in group if not r.get("success", False)]
@@ -904,9 +948,7 @@ def _aggregate(records: List[Dict]) -> List[Dict]:
         summary.append(
             {
                 "goal": goal,
-                "policy": policy,
                 "guidance_policy": guidance_policy,
-                "tool_description_mode": mode,
                 "runs": runs,
                 "successes": success_count,
                 "failures": failure_count,
@@ -941,9 +983,7 @@ def _write_results(records: List[Dict], summary: List[Dict]) -> None:
             " | ".join(
                 [
                     f"goal={row['goal']}",
-                    f"policy={row['policy']}",
                     f"guidance_policy={row['guidance_policy']}",
-                    f"tool_description_mode={row['tool_description_mode']}",
                     f"success_rate={row['success_rate']:.2%} ({row['successes']}/{row['runs']})",
                     f"failure_count={row['failures']}",
                     f"avg_steps_when_success={step_text}",
@@ -963,7 +1003,6 @@ def _write_results(records: List[Dict], summary: List[Dict]) -> None:
 def _build_savepoint_payload(
     *,
     goals: List[str],
-    policies: List[str],
     guidance_policies: List[str],
     records: List[Dict],
     completed_goals: List[str],
@@ -979,13 +1018,9 @@ def _build_savepoint_payload(
         "agent_id": AGENT_ID,
         "guidance_policies": guidance_policies,
         "goals": goals,
-        "policies": policies,
-        "tool_description_modes": TOOL_DESCRIPTION_MODES,
         "total_runs_planned": (
             len(goals)
-            * len(policies)
             * len(guidance_policies)
-            * len(TOOL_DESCRIPTION_MODES)
             * RUNS_PER_COMBINATION
         ),
         "next_goal_index": next_goal_index,
@@ -998,67 +1033,55 @@ def _build_savepoint_payload(
 
 
 def _build_run_plan(
-    goals: List[str], policies: List[str], guidance_policies: List[str]
+    goals: List[str], guidance_policies: List[str]
 ) -> List[Dict[str, object]]:
     plan: List[Dict[str, object]] = []
     for goal in goals:
-        for policy in policies:
-            for guidance_policy in guidance_policies:
-                for mode in TOOL_DESCRIPTION_MODES:
-                    for run_idx in range(1, RUNS_PER_COMBINATION + 1):
-                        plan.append(
-                            {
-                                "goal": goal,
-                                "policy": policy,
-                                "guidance_policy": guidance_policy,
-                                "tool_description_mode": mode,
-                                "run": run_idx,
-                            }
-                        )
+        for guidance_policy in guidance_policies:
+            for run_idx in range(1, RUNS_PER_COMBINATION + 1):
+                plan.append(
+                    {
+                        "goal": goal,
+                        "guidance_policy": guidance_policy,
+                        "run": run_idx,
+                    }
+                )
     return plan
 
 
 def _run_goal(
-    goal: str, policies: List[str], guidance_policies: List[str]
+    goal: str, guidance_policies: List[str]
 ) -> Tuple[List[Dict], bool]:
     goal_records: List[Dict] = []
-    for policy in policies:
-        for guidance_policy in guidance_policies:
-            for mode in TOOL_DESCRIPTION_MODES:
-                for run_idx in range(1, RUNS_PER_COMBINATION + 1):
-                    try:
-                        rec = _run_single(
-                            goal=goal,
-                            policy=policy,
-                            guidance_policy=guidance_policy,
-                            tool_description_mode=mode,
-                            run_idx=run_idx,
-                        )
-                    except EvaluationStopRequested:
-                        return goal_records, True
-                    except Exception as exc:
-                        rec = _build_exception_record(
-                            goal=goal,
-                            policy=policy,
-                            guidance_policy=guidance_policy,
-                            tool_description_mode=mode,
-                            run_idx=run_idx,
-                            exc=exc,
-                        )
-                        EVAL_STATE.add_event(
-                            (
-                                "Run "
-                                f"{run_idx} failed with exception for "
-                                "goal="
-                                f"{goal}, policy={policy}, guidance_policy="
-                                f"{guidance_policy}, mode={mode}: {exc}"
-                            )
-                        )
-                    normalized = _normalize_record(rec)
-                    goal_records.append(normalized)
-                    EVAL_STATE.add_record(normalized)
-                    if EVAL_CONTROL.stop_requested():
-                        return goal_records, True
+    for guidance_policy in guidance_policies:
+        for run_idx in range(1, RUNS_PER_COMBINATION + 1):
+            try:
+                rec = _run_single(
+                    goal=goal,
+                    guidance_policy=guidance_policy,
+                    run_idx=run_idx,
+                )
+            except EvaluationStopRequested:
+                return goal_records, True
+            except Exception as exc:
+                rec = _build_exception_record(
+                    goal=goal,
+                    guidance_policy=guidance_policy,
+                    run_idx=run_idx,
+                    exc=exc,
+                )
+                EVAL_STATE.add_event(
+                    (
+                        "Run "
+                        f"{run_idx} failed with exception for "
+                        f"goal={goal}, guidance_policy={guidance_policy}: {exc}"
+                    )
+                )
+            normalized = _normalize_record(rec)
+            goal_records.append(normalized)
+            EVAL_STATE.add_record(normalized)
+            if EVAL_CONTROL.stop_requested():
+                return goal_records, True
     return goal_records, False
 
 
@@ -1100,6 +1123,7 @@ def main() -> None:
         mcp_proc = _ensure_service(
             name="exploration guidance MCP server",
             health_url=MCP_HEALTH_URL,
+            extra_health_urls=[MCP_STATE_URL],
             cmd=[sys.executable, "exploration_mcp/exploration_guidance_mcp_server.py"],
             cwd=project_root,
         )
@@ -1112,26 +1136,20 @@ def main() -> None:
             EVAL_STATE.add_event("Reused existing exploration guidance MCP server")
 
         goals = _discover_exit_goals()
-        policies = _discover_policies()
         guidance_policies = list(GUIDANCE_ALLOWED_POLICIES)
         total_runs = (
             len(goals)
-            * len(policies)
             * len(guidance_policies)
-            * len(TOOL_DESCRIPTION_MODES)
             * RUNS_PER_COMBINATION
         )
         runs_per_goal = (
-            len(policies)
-            * len(guidance_policies)
-            * len(TOOL_DESCRIPTION_MODES)
+            len(guidance_policies)
             * RUNS_PER_COMBINATION
         )
-        run_plan = _build_run_plan(goals, policies, guidance_policies)
+        run_plan = _build_run_plan(goals, guidance_policies)
         EVAL_STATE.update(
             phase="awaiting_start",
             goals=goals,
-            policies=policies,
             guidance_policies=guidance_policies,
             total_runs_planned=total_runs,
             current_run=None,
@@ -1144,9 +1162,8 @@ def main() -> None:
         )
         EVAL_STATE.add_event(
             (
-                f"Discovered goals={goals}, policies={policies}, "
-                f"guidance_policies={guidance_policies}, "
-                f"modes={TOOL_DESCRIPTION_MODES}, total_runs={total_runs}"
+                f"Discovered goals={goals}, "
+                f"guidance_policies={guidance_policies}, total_runs={total_runs}"
             )
         )
         EVAL_STATE.add_event(
@@ -1168,20 +1185,14 @@ def main() -> None:
                 savepoint_name = str(start_request.get("savepoint", ""))
                 payload = _load_savepoint(savepoint_name)
                 payload_goals = payload.get("goals")
-                payload_policies = payload.get("policies")
                 payload_guidance_policies = payload.get("guidance_policies")
-                payload_modes = payload.get("tool_description_modes")
-                if payload_goals != goals or payload_policies != policies:
+                if payload_goals != goals:
                     raise RuntimeError(
-                        "Savepoint goals/policies do not match the current environment"
+                        "Savepoint goals do not match the current environment"
                     )
                 if payload_guidance_policies != guidance_policies:
                     raise RuntimeError(
                         "Savepoint guidance_policies do not match current settings"
-                    )
-                if payload_modes != TOOL_DESCRIPTION_MODES:
-                    raise RuntimeError(
-                        "Savepoint tool description modes do not match current settings"
                     )
                 records_obj = payload.get("records")
                 if not isinstance(records_obj, list):
@@ -1230,16 +1241,12 @@ def main() -> None:
 
             item = run_plan[plan_index]
             goal = str(item["goal"])
-            policy = str(item["policy"])
             guidance_policy = str(item["guidance_policy"])
-            tool_description_mode = str(item["tool_description_mode"])
-            run_idx = int(item["run"])
+            run_idx = int(str(item["run"]))
             try:
                 rec = _run_single(
                     goal=goal,
-                    policy=policy,
                     guidance_policy=guidance_policy,
-                    tool_description_mode=tool_description_mode,
                     run_idx=run_idx,
                 )
             except EvaluationStopRequested:
@@ -1253,9 +1260,7 @@ def main() -> None:
             except Exception as exc:
                 rec = _build_exception_record(
                     goal=goal,
-                    policy=policy,
                     guidance_policy=guidance_policy,
-                    tool_description_mode=tool_description_mode,
                     run_idx=run_idx,
                     exc=exc,
                 )
@@ -1263,8 +1268,7 @@ def main() -> None:
                     (
                         "Run "
                         f"{run_idx} failed with exception for goal={goal}, "
-                        f"policy={policy}, guidance_policy={guidance_policy}, "
-                        f"mode={tool_description_mode}: {exc}"
+                        f"guidance_policy={guidance_policy}: {exc}"
                     )
                 )
 
@@ -1273,22 +1277,18 @@ def main() -> None:
             EVAL_STATE.add_record(normalized)
             next_plan_index = plan_index + 1
 
-            # Auto-save after finishing all runs for the current (goal, policy) block.
-            goal_policy_block_done = next_plan_index >= len(run_plan)
-            if not goal_policy_block_done:
+            # Auto-save after finishing all runs for the current goal block.
+            goal_block_done = next_plan_index >= len(run_plan)
+            if not goal_block_done:
                 next_item = run_plan[next_plan_index]
-                goal_policy_block_done = (
-                    str(next_item["goal"]) != goal
-                    or str(next_item["policy"]) != policy
-                )
-            if goal_policy_block_done:
+                goal_block_done = str(next_item["goal"]) != goal
+            if goal_block_done:
                 next_goal_index = (
                     next_plan_index // runs_per_goal if runs_per_goal > 0 else len(goals)
                 )
                 completed_goals = goals[:next_goal_index]
                 savepoint_payload = _build_savepoint_payload(
                     goals=goals,
-                    policies=policies,
                     guidance_policies=guidance_policies,
                     records=committed_records,
                     completed_goals=completed_goals,
@@ -1298,7 +1298,7 @@ def main() -> None:
                 savepoint_path = _write_savepoint(savepoint_payload)
                 EVAL_STATE.add_event(
                     "Created auto-savepoint after completing "
-                    f"goal={goal}, policy={policy}: {savepoint_path.as_posix()}"
+                    f"goal={goal}: {savepoint_path.as_posix()}"
                 )
 
             if EVAL_CONTROL.stop_requested():
@@ -1313,7 +1313,6 @@ def main() -> None:
             EVAL_STATE.update(phase="creating_savepoint")
             savepoint_payload = _build_savepoint_payload(
                 goals=goals,
-                policies=policies,
                 guidance_policies=guidance_policies,
                 records=committed_records,
                 completed_goals=completed_goals,
